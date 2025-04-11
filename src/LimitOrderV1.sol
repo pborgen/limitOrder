@@ -3,196 +3,194 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import "@openzeppelin/contracts/metatx/ERC2771Context.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./interface/IUniswapV2Router02.sol";
 
-contract LimitOrderBook is ERC2771Context, EIP712, ReentrancyGuard {
+contract LimitOrderBook is ReentrancyGuard {
+    uint256 public placeOrderFee;
+    address public owner;
+
     // Trusted forwarder address for gasless transactions
-    constructor(
-        address trustedForwarder
-    ) ERC2771Context(trustedForwarder) EIP712("LimitOrderBook", "1") {}
+    constructor(uint256 _placeOrderFee) {
+        placeOrderFee = _placeOrderFee;
+        owner = msg.sender;
+    }
 
     // Order structure
     struct Order {
-        address maker; // User who created the order
+        address creator; // User who created the order
+        address router; // Router to use
         address tokenIn; // Token to sell
         address tokenOut; // Token to buy
         uint256 amountIn; // Amount to sell
-        uint256 amountOut; // Amount to receive (based on limit price)
+        uint256 amountOutMin; // Amount to receive (based on limit price)
+        uint256 amountOutActual;
         bool isBuy; // True for buy order, false for sell order
         uint256 expiry; // Order expiration timestamp
         bool active; // Order status
-        bytes32 orderHash; // Unique order identifier
+        uint256 fee; // Fee paid for the order
+        uint256 creationBlock; // Block number of the order
+        uint256 orderId; // Numeric order ID
     }
 
     // Mapping to store orders
-    mapping(bytes32 => Order) public orders;
+    mapping(uint256 => Order) public orders;
+    mapping(address => bool) public allowedToExecuteOrders;
 
     // Events
-    event OrderPlaced(
-        bytes32 indexed orderHash,
-        address indexed maker,
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 amountOut,
-        bool isBuy,
-        uint256 expiry
-    );
-    event OrderCancelled(bytes32 indexed orderHash);
+    event OrderPlaced(address indexed maker, uint256 orderId);
+    event OrderCancelled(uint256 orderId);
     event OrderExecuted(
-        bytes32 indexed orderHash,
-        address indexed taker,
-        uint256 amountIn,
-        uint256 amountOut
+        address indexed maker,
+        uint256 indexed orderId,
+        uint256 actualAmountOut
     );
+
+    // Helper function to convert bytes32 to uint256
+    function bytes32ToUint256(bytes32 _bytes) public pure returns (uint256) {
+        return uint256(_bytes);
+    }
 
     // Place a limit order (gasless via meta-transaction)
     function placeOrder(
+        address router,
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
-        uint256 amountOut,
+        uint256 amountOutMin,
         bool isBuy,
-        uint256 expiry,
-        bytes memory signature
-    ) external nonReentrant {
-        require(expiry > block.timestamp, "Order expired");
-        require(amountIn > 0 && amountOut > 0, "Invalid amounts");
-
-        // Generate order hash using EIP-712
-        bytes32 orderHash = _hashOrder(
-            _msgSender(),
-            tokenIn,
-            tokenOut,
-            amountIn,
-            amountOut,
-            isBuy,
-            expiry
+        uint256 expiry
+    ) external payable nonReentrant {
+        require(router != address(0), "Invalid router");
+        require(tokenIn != tokenOut, "Invalid token pair");
+        require(
+            tokenIn != address(0) && tokenOut != address(0),
+            "Invalid token"
         );
 
-        // Verify signature
+        require(expiry > block.timestamp, "Order expired");
+        require(amountIn > 0 && amountOutMin > 0, "Invalid amounts");
+
+        // Verify approval
         require(
-            _verifySignature(orderHash, signature, _msgSender()),
-            "Invalid signature"
+            IERC20(tokenIn).allowance(msg.sender, address(this)) >= amountIn,
+            "Token not approved"
+        );
+
+        // Make sure fee was sent
+        require(msg.value == placeOrderFee, "Incorrect fee");
+
+        bytes32 orderHash = keccak256(
+            abi.encodePacked(msg.sender, block.number)
+        );
+        uint256 numericOrderId = bytes32ToUint256(orderHash);
+
+        // make sure an order was not created in the same block
+        require(
+            orders[numericOrderId].creationBlock != block.number,
+            "Order already created in this block"
         );
 
         // Create order
-        orders[orderHash] = Order({
-            maker: _msgSender(),
+        orders[numericOrderId] = Order({
+            creator: msg.sender,
+            router: router,
             tokenIn: tokenIn,
             tokenOut: tokenOut,
             amountIn: amountIn,
-            amountOut: amountOut,
+            amountOutMin: amountOutMin,
+            amountOutActual: 0,
             isBuy: isBuy,
             expiry: expiry,
             active: true,
-            orderHash: orderHash
+            fee: placeOrderFee,
+            creationBlock: block.number,
+            orderId: numericOrderId
         });
 
-        // Transfer tokens from maker to contract (for sell orders)
-        if (!isBuy) {
-            IERC20(tokenIn).transferFrom(_msgSender(), address(this), amountIn);
-        }
-
-        emit OrderPlaced(
-            orderHash,
-            _msgSender(),
-            tokenIn,
-            tokenOut,
-            amountIn,
-            amountOut,
-            isBuy,
-            expiry
-        );
+        emit OrderPlaced(msg.sender, numericOrderId);
     }
 
     // Cancel an order
-    function cancelOrder(bytes32 orderHash) external nonReentrant {
-        Order storage order = orders[orderHash];
-        require(order.maker == _msgSender(), "Not order maker");
+    function cancelOrder(uint256 orderId) external nonReentrant {
+        Order storage order = orders[orderId];
+        require(order.creator == msg.sender, "Not order creator");
         require(order.active, "Order inactive");
 
         order.active = false;
 
-        // Refund tokens for sell orders
-        if (!order.isBuy && order.amountIn > 0) {
-            IERC20(order.tokenIn).transfer(order.maker, order.amountIn);
-        }
+        // Refund 1/2 of the fee
+        (bool success, ) = order.creator.call{value: order.fee / 2}("");
+        require(success, "Refund failed");
 
-        emit OrderCancelled(orderHash);
+        emit OrderCancelled(orderId);
     }
 
     // Execute an order (called by taker)
-    function executeOrder(
-        bytes32 orderHash,
-        uint256 amountIn
-    ) external nonReentrant {
-        Order storage order = orders[orderHash];
+    function executeOrder(uint256 orderId) external nonReentrant {
+        require(
+            allowedToExecuteOrders[msg.sender],
+            "Not allowed to execute orders"
+        );
+
+        Order storage order = orders[orderId];
         require(order.active, "Order inactive");
         require(block.timestamp <= order.expiry, "Order expired");
-        require(amountIn <= order.amountIn, "Invalid amount");
 
-        address taker = _msgSender();
-        uint256 amountOut = (amountIn * order.amountOut) / order.amountIn;
+        address[] memory path = new address[](2);
+        path[0] = order.tokenIn;
+        path[1] = order.tokenOut;
 
-        // Transfer tokens
-        if (order.isBuy) {
-            // Buy order: taker sends tokenIn, maker sends tokenOut
-            IERC20(order.tokenIn).transferFrom(taker, order.maker, amountIn);
-            IERC20(order.tokenOut).transferFrom(order.maker, taker, amountOut);
-        } else {
-            // Sell order: contract sends tokenIn, taker sends tokenOut
-            IERC20(order.tokenIn).transfer(taker, amountIn);
-            IERC20(order.tokenOut).transferFrom(taker, order.maker, amountOut);
-        }
+        // transfer tokens to this contract
+        IERC20(order.tokenIn).transferFrom(
+            msg.sender,
+            address(this),
+            order.amountIn
+        );
 
-        // Update order
-        order.amountIn -= amountIn;
-        order.amountOut -= amountOut;
-        if (order.amountIn == 0) {
-            order.active = false;
-        }
+        // approve the router to spend the tokens
+        IERC20(order.tokenIn).approve(order.router, order.amountIn);
 
-        emit OrderExecuted(orderHash, taker, amountIn, amountOut);
-    }
+        uint256 amountBeforeSwap = IERC20(order.tokenOut).balanceOf(
+            address(this)
+        );
 
-    // EIP-712 order hash
-    function _hashOrder(
-        address maker,
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 amountOut,
-        bool isBuy,
-        uint256 expiry
-    ) internal view returns (bytes32) {
-        return
-            _hashTypedDataV4(
-                keccak256(
-                    abi.encode(
-                        keccak256(
-                            "Order(address maker,address tokenIn,address tokenOut,uint256 amountIn,uint256 amountOut,bool isBuy,uint256 expiry)"
-                        ),
-                        maker,
-                        tokenIn,
-                        tokenOut,
-                        amountIn,
-                        amountOut,
-                        isBuy,
-                        expiry
-                    )
-                )
+        IUniswapV2Router02(order.router)
+            .swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                order.amountIn,
+                order.amountOutMin,
+                path,
+                order.creator,
+                block.timestamp
             );
+
+        uint256 amountAfterSwap = IERC20(order.tokenOut).balanceOf(
+            address(this)
+        );
+
+        uint256 actualAmountOut = amountAfterSwap - amountBeforeSwap;
+
+        emit OrderExecuted(order.creator, orderId, actualAmountOut);
     }
 
-    // Verify EIP-712 signature
-    function _verifySignature(
-        bytes32 orderHash,
-        bytes memory signature,
-        address signer
-    ) internal view returns (bool) {
-        address recovered = ECDSA.recover(orderHash, signature);
-        return recovered == signer;
+    // Withdraw collected fees
+    function withdrawFees() external {
+        require(msg.sender == owner, "Not owner");
+        (bool success, ) = owner.call{value: address(this).balance}("");
+        require(success, "Withdraw failed");
+    }
+
+    function withdrawToken(address token) external {
+        require(msg.sender == owner, "Not owner");
+        IERC20(token).transfer(
+            msg.sender,
+            IERC20(token).balanceOf(address(this))
+        );
+    }
+
+    // Update fee amount
+    function updateFee(uint256 _newFee) external {
+        require(msg.sender == owner, "Not owner");
+        placeOrderFee = _newFee;
     }
 }
