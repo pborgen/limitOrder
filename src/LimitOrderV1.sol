@@ -46,7 +46,9 @@ contract LimitOrderBookV1 is ReentrancyGuard {
     event OrderExecuted(
         address indexed maker,
         uint256 indexed orderId,
-        uint256 actualAmountOut
+        uint256 actualAmountOut,
+        bool success,
+        string message
     );
 
     // Helper function to convert bytes32 to uint256
@@ -144,44 +146,49 @@ contract LimitOrderBookV1 is ReentrancyGuard {
         path[1] = order.tokenOut;
 
         // transfer tokens to this contract
-        IERC20(order.tokenIn).transferFrom(
+        bool transferSuccess = IERC20(order.tokenIn).transferFrom(
             msg.sender,
             address(this),
             order.amountIn
         );
+        
+        if (transferSuccess) {
+            // approve the router to spend the tokens
+            IERC20(order.tokenIn).approve(order.router, order.amountIn);
 
-        // approve the router to spend the tokens
-        IERC20(order.tokenIn).approve(order.router, order.amountIn);
-
-        uint256 amountBeforeSwap = IERC20(order.tokenOut).balanceOf(
-            address(this)
-        );
-
-        IUniswapV2Router02(order.router)
-            .swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                order.amountIn,
-                order.amountOutMin,
-                path,
-                order.creator,
-                block.timestamp
+            uint256 amountBeforeSwap = IERC20(order.tokenOut).balanceOf(
+                address(this)
             );
 
-        uint256 amountAfterSwap = IERC20(order.tokenOut).balanceOf(
-            address(this)
-        );
+            IUniswapV2Router02(order.router)
+                .swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                    order.amountIn,
+                    order.amountOutMin,
+                    path,
+                    order.creator,
+                    block.timestamp
+                );
 
-        uint256 actualAmountOut = amountAfterSwap - amountBeforeSwap;
+            uint256 amountAfterSwap = IERC20(order.tokenOut).balanceOf(
+                address(this)
+            );
 
-        order.amountOutActual = actualAmountOut;
+            uint256 actualAmountOut = amountAfterSwap - amountBeforeSwap;
+
+            order.amountOutActual = actualAmountOut;
+           
+            emit OrderExecuted(order.creator, orderId, actualAmountOut, true, "success");
+        } else {
+            emit OrderExecuted(order.creator, orderId, 0, false, "transferFrom failed");
+        }
+
         order.active = false;
 
         // refund the execution fee
         (bool success, ) = msg.sender.call{value: order.executionFee}("");
-        require(success, "Refund failed");
+        require(success, "executionFee send failed");
 
         executionFeeTotalHeld -= order.executionFee;
-
-        emit OrderExecuted(order.creator, orderId, actualAmountOut);
     }
 
     // Withdraw collected fees
