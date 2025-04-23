@@ -6,7 +6,7 @@ import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./interface/IUniswapV2Router02.sol";
 
-contract LimitOrderBook is ReentrancyGuard {
+contract LimitOrderBookV1 is ReentrancyGuard {
     uint256 public placeOrderFee;
     address public owner;
 
@@ -25,7 +25,6 @@ contract LimitOrderBook is ReentrancyGuard {
         uint256 amountIn; // Amount to sell
         uint256 amountOutMin; // Amount to receive (based on limit price)
         uint256 amountOutActual;
-        bool isBuy; // True for buy order, false for sell order
         uint256 expiry; // Order expiration timestamp
         bool active; // Order status
         uint256 fee; // Fee paid for the order
@@ -58,7 +57,6 @@ contract LimitOrderBook is ReentrancyGuard {
         address tokenOut,
         uint256 amountIn,
         uint256 amountOutMin,
-        bool isBuy,
         uint256 expiry
     ) external payable nonReentrant {
         require(router != address(0), "Invalid router");
@@ -81,13 +79,13 @@ contract LimitOrderBook is ReentrancyGuard {
         require(msg.value == placeOrderFee, "Incorrect fee");
 
         bytes32 orderHash = keccak256(
-            abi.encodePacked(msg.sender, block.number)
+            abi.encodePacked(msg.sender, block.number, block.timestamp)
         );
         uint256 numericOrderId = bytes32ToUint256(orderHash);
 
-        // make sure an order was not created in the same block
+        // make sure an order was not created already
         require(
-            orders[numericOrderId].creationBlock != block.number,
+            orders[numericOrderId].creationBlock == 0,
             "Order already created in this block"
         );
 
@@ -100,7 +98,6 @@ contract LimitOrderBook is ReentrancyGuard {
             amountIn: amountIn,
             amountOutMin: amountOutMin,
             amountOutActual: 0,
-            isBuy: isBuy,
             expiry: expiry,
             active: true,
             fee: placeOrderFee,
@@ -169,6 +166,9 @@ contract LimitOrderBook is ReentrancyGuard {
         );
 
         uint256 actualAmountOut = amountAfterSwap - amountBeforeSwap;
+
+        order.amountOutActual = actualAmountOut;
+        order.active = false;
 
         emit OrderExecuted(order.creator, orderId, actualAmountOut);
     }
