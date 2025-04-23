@@ -7,12 +7,15 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./interface/IUniswapV2Router02.sol";
 
 contract LimitOrderBookV1 is ReentrancyGuard {
-    uint256 public placeOrderFee;
+    uint256 public platformFee;
+    uint256 public executionFee;
+    uint256 public executionFeeTotalHeld;
     address public owner;
 
     // Trusted forwarder address for gasless transactions
-    constructor(uint256 _placeOrderFee) {
-        placeOrderFee = _placeOrderFee;
+    constructor(uint256 _platformFee, uint256 _executionFee) {
+        platformFee = _platformFee;
+        executionFee = _executionFee;
         owner = msg.sender;
     }
 
@@ -27,7 +30,8 @@ contract LimitOrderBookV1 is ReentrancyGuard {
         uint256 amountOutActual;
         uint256 expiry; // Order expiration timestamp
         bool active; // Order status
-        uint256 fee; // Fee paid for the order
+        uint256 platformFee; // Fee paid for the order
+        uint256 executionFee; // Fee paid for the execution
         uint256 creationBlock; // Block number of the order
         uint256 orderId; // Numeric order ID
     }
@@ -76,7 +80,7 @@ contract LimitOrderBookV1 is ReentrancyGuard {
         );
 
         // Make sure fee was sent
-        require(msg.value == placeOrderFee, "Incorrect fee");
+        require(msg.value == platformFee + executionFee, "Incorrect fee");
 
         bytes32 orderHash = keccak256(
             abi.encodePacked(msg.sender, block.number, block.timestamp)
@@ -100,10 +104,13 @@ contract LimitOrderBookV1 is ReentrancyGuard {
             amountOutActual: 0,
             expiry: expiry,
             active: true,
-            fee: placeOrderFee,
+            platformFee: platformFee,
+            executionFee: executionFee,
             creationBlock: block.number,
             orderId: numericOrderId
         });
+
+        executionFeeTotalHeld += executionFee;
 
         emit OrderPlaced(msg.sender, numericOrderId);
     }
@@ -117,18 +124,16 @@ contract LimitOrderBookV1 is ReentrancyGuard {
         order.active = false;
 
         // Refund 1/2 of the fee
-        (bool success, ) = order.creator.call{value: order.fee / 2}("");
+        uint256 refundAmount = (order.executionFee) / 2;
+        (bool success, ) = order.creator.call{value: refundAmount}("");
         require(success, "Refund failed");
 
+        executionFeeTotalHeld -= order.executionFee;
         emit OrderCancelled(orderId);
     }
 
     // Execute an order (called by taker)
     function executeOrder(uint256 orderId) external nonReentrant {
-        require(
-            allowedToExecuteOrders[msg.sender],
-            "Not allowed to execute orders"
-        );
 
         Order storage order = orders[orderId];
         require(order.active, "Order inactive");
@@ -170,13 +175,21 @@ contract LimitOrderBookV1 is ReentrancyGuard {
         order.amountOutActual = actualAmountOut;
         order.active = false;
 
+        // refund the execution fee
+        (bool success, ) = msg.sender.call{value: order.executionFee}("");
+        require(success, "Refund failed");
+
+        executionFeeTotalHeld -= order.executionFee;
+
         emit OrderExecuted(order.creator, orderId, actualAmountOut);
     }
 
     // Withdraw collected fees
-    function withdrawFees() external {
+    function withdrawPlatformFees() external {
         require(msg.sender == owner, "Not owner");
-        (bool success, ) = owner.call{value: address(this).balance}("");
+
+        uint256 platformFees = address(this).balance - executionFeeTotalHeld;
+        (bool success, ) = owner.call{value: platformFees}("");
         require(success, "Withdraw failed");
     }
 
@@ -188,9 +201,9 @@ contract LimitOrderBookV1 is ReentrancyGuard {
         );
     }
 
-    // Update fee amount
-    function updateFee(uint256 _newFee) external {
+    function updateFees(uint256 _newPlatformFee, uint256 _newExecutionFee) external {
         require(msg.sender == owner, "Not owner");
-        placeOrderFee = _newFee;
+        platformFee = _newPlatformFee;
+        executionFee = _newExecutionFee;
     }
 }
